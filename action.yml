@@ -1,0 +1,305 @@
+name: "Terraform Security Analysis"
+description: "Analyzes Terraform PR changes for security misconfigurations using GitHub Copilot. Posts a prioritized security report as a PR comment."
+
+branding:
+  icon: "shield"
+  color: "red"
+
+inputs:
+  github-token:
+    description: "GitHub token used for Copilot API calls and posting PR comments. Defaults to the built-in GITHUB_TOKEN."
+    required: false
+    default: ${{ github.token }}
+  terraform-directory:
+    description: "Root directory to scan for Terraform files (relative to repo root)"
+    required: false
+    default: "."
+  max-files:
+    description: "Maximum number of changed Terraform files to include in the analysis"
+    required: false
+    default: "10"
+  model:
+    description: "GitHub Models model ID to use for the analysis"
+    required: false
+    default: "gpt-5"
+  post-pr-comment:
+    description: "Post the analysis as a PR comment (true/false)"
+    required: false
+    default: "true"
+  custom-prompt:
+    description: >
+      Custom security analysis prompt. Overrides the built-in prompt when set.
+      Use the placeholder {TERRAFORM_FILES} where file contents should be injected.
+    required: false
+    default: ""
+
+outputs:
+  report:
+    description: "The security analysis report in Markdown format"
+    value: ${{ steps.report.outputs.report }}
+  changed-files:
+    description: "Newline-separated list of changed Terraform files that were analyzed"
+    value: ${{ steps.collect.outputs.changed_files }}
+
+runs:
+  using: "composite"
+  steps:
+    # ── 1. Collect changed Terraform files ──────────────────────────────
+    - name: Collect changed Terraform files
+      id: collect
+      shell: bash
+      env:
+        TF_DIR: ${{ inputs.terraform-directory }}
+        MAX_FILES: ${{ inputs.max-files }}
+        EVENT_NAME: ${{ github.event_name }}
+        PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+        BEFORE_SHA: ${{ github.event.before }}
+        CURRENT_SHA: ${{ github.sha }}
+      run: |
+        set -euo pipefail
+
+        # ── Determine changed files based on event type ──
+        if [[ "$EVENT_NAME" == "pull_request" || "$EVENT_NAME" == "pull_request_target" ]]; then
+          BASE="origin/${PR_BASE_REF}"
+          ALL_CHANGED=$(git diff --name-only "${BASE}...${CURRENT_SHA}" 2>/dev/null || true)
+        elif [[ "$EVENT_NAME" == "push" ]] \
+          && [[ -n "$BEFORE_SHA" ]] \
+          && [[ "$BEFORE_SHA" != "0000000000000000000000000000000000000000" ]]; then
+          ALL_CHANGED=$(git diff --name-only "$BEFORE_SHA" "$CURRENT_SHA" 2>/dev/null || true)
+        else
+          # workflow_dispatch or initial push — scan all Terraform files
+          ALL_CHANGED=$(find "$TF_DIR" -type f \( -name '*.tf' -o -name '*.tfvars' \) 2>/dev/null || true)
+        fi
+
+        # ── Filter to .tf/.tfvars inside terraform-directory ──
+        FILES=""
+        COUNT=0
+        while IFS= read -r file; do
+          [[ -z "$file" ]] && continue
+          # Match only Terraform file extensions
+          case "$file" in
+            *.tf|*.tfvars) ;;
+            *) continue ;;
+          esac
+          # Scope to the configured directory
+          if [[ "$TF_DIR" != "." ]] && [[ "$file" != "$TF_DIR"/* ]]; then
+            continue
+          fi
+          [[ ! -f "$file" ]] && continue
+          FILES="${FILES}${file}"$'\n'
+          COUNT=$((COUNT + 1))
+          [[ "$COUNT" -ge "$MAX_FILES" ]] && break
+        done <<< "$ALL_CHANGED"
+
+        if [[ -z "$FILES" ]]; then
+          echo "ℹ️ No changed Terraform files found."
+          echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          echo "changed_files=" >> "$GITHUB_OUTPUT"
+          {
+            echo 'files_content<<GHADELIM_FC'
+            echo 'No Terraform files changed.'
+            echo 'GHADELIM_FC'
+          } >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        echo "has_changes=true" >> "$GITHUB_OUTPUT"
+        echo "📂 Found $COUNT Terraform file(s) to analyze."
+
+        {
+          echo 'changed_files<<GHADELIM_CF'
+          printf '%s' "$FILES"
+          echo 'GHADELIM_CF'
+        } >> "$GITHUB_OUTPUT"
+
+        {
+          echo 'files_content<<GHADELIM_FC'
+          while IFS= read -r file; do
+            [[ -z "$file" ]] && continue
+            echo "=== $file ==="
+            cat "$file"
+            echo ""
+          done <<< "$FILES"
+          echo 'GHADELIM_FC'
+        } >> "$GITHUB_OUTPUT"
+
+    # ── 2. Call GitHub Copilot (GitHub Models) ────────────────────────
+    - name: Run Copilot analysis
+      id: llm
+      if: steps.collect.outputs.has_changes == 'true'
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        LLM_MODEL: ${{ inputs.model }}
+        CUSTOM_PROMPT: ${{ inputs.custom-prompt }}
+        TERRAFORM_FILES: ${{ steps.collect.outputs.files_content }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+
+        LLM_API_URL="https://models.inference.ai.azure.com/chat/completions"
+        MAX_TOKENS=16000
+
+        # ── Build system prompt and user message ──
+        if [[ -n "$CUSTOM_PROMPT" ]]; then
+          SYSTEM_PROMPT=""
+          USER_MESSAGE="${CUSTOM_PROMPT//\{TERRAFORM_FILES\}/$TERRAFORM_FILES}"
+        else
+          # Load agent instructions from agents/ directory
+          AGENT_FILE="${ACTION_PATH}/agents/terraform-security-analyzer.md"
+          if [[ -f "$AGENT_FILE" ]]; then
+            SYSTEM_PROMPT=$(cat "$AGENT_FILE")
+          else
+            SYSTEM_PROMPT="You are a security engineer specialized in Terraform infrastructure security analysis."
+          fi
+
+          USER_MESSAGE="Analyze the following Terraform file changes and produce a security analysis report following your output format.
+
+        Changed Terraform Files:
+        ===
+        ${TERRAFORM_FILES}
+        ==="
+        fi
+
+        # ── Build JSON payload safely with jq ──
+        if [[ -n "$SYSTEM_PROMPT" ]]; then
+          PAYLOAD=$(jq -n \
+            --arg model "$LLM_MODEL" \
+            --arg system "$SYSTEM_PROMPT" \
+            --arg user "$USER_MESSAGE" \
+            --argjson max_completion_tokens $MAX_TOKENS \
+            '{
+              model: $model,
+              messages: [
+                {role: "system", content: $system},
+                {role: "user",   content: $user}
+              ],
+              max_completion_tokens: $max_completion_tokens
+            }')
+        else
+          PAYLOAD=$(jq -n \
+            --arg model "$LLM_MODEL" \
+            --arg user "$USER_MESSAGE" \
+            --argjson max_completion_tokens $MAX_TOKENS \
+            '{
+              model: $model,
+              messages: [{role: "user", content: $user}],
+              max_completion_tokens: $max_completion_tokens
+            }')
+        fi
+
+        # ── Call GitHub Copilot (GitHub Models) API ──
+        HTTP_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$LLM_API_URL" \
+          -H "Content-Type: application/json" \
+          -H "Authorization: Bearer $GITHUB_TOKEN" \
+          --max-time 300 \
+          -d "$PAYLOAD")
+
+        HTTP_CODE=$(echo "$HTTP_RESPONSE" | tail -1)
+        RESPONSE_BODY=$(echo "$HTTP_RESPONSE" | sed '$d')
+
+        if [[ "$HTTP_CODE" -lt 200 || "$HTTP_CODE" -ge 300 ]]; then
+          echo "::error::GitHub Copilot API returned HTTP $HTTP_CODE"
+          echo "::group::Response body"
+          echo "$RESPONSE_BODY"
+          echo "::endgroup::"
+          exit 1
+        fi
+
+        # ── Extract the analysis text ──
+        ANALYSIS=$(echo "$RESPONSE_BODY" | jq -r '.choices[0].message.content // empty')
+
+        if [[ -z "$ANALYSIS" ]]; then
+          echo "::error::Could not extract analysis from GitHub Copilot response."
+          echo "::group::Raw API response"
+          echo "$RESPONSE_BODY" | head -c 2000
+          echo "::endgroup::"
+          exit 1
+        fi
+
+        {
+          echo 'analysis<<GHADELIM_AN'
+          echo "$ANALYSIS"
+          echo 'GHADELIM_AN'
+        } >> "$GITHUB_OUTPUT"
+
+    # ── 3. Generate the Markdown report ─────────────────────────────────
+    - name: Generate report
+      id: report
+      if: steps.collect.outputs.has_changes == 'true'
+      shell: bash
+      env:
+        CHANGED_FILES: ${{ steps.collect.outputs.changed_files }}
+        ANALYSIS: ${{ steps.llm.outputs.analysis }}
+      run: |
+        set -euo pipefail
+
+        {
+          echo "## 🔒 Terraform Security Analysis"
+          echo ""
+          echo "<details><summary>Analyzed files</summary>"
+          echo ""
+          echo '```'
+          echo "$CHANGED_FILES"
+          echo '```'
+          echo ""
+          echo "</details>"
+          echo ""
+          echo "$ANALYSIS"
+          echo ""
+          echo "---"
+          echo "*Generated by [DevOps Copilot Toolkit — Security](https://github.com/devops-copilot-toolkit/devops-copilot-toolkit)*"
+        } > "$RUNNER_TEMP/finops-report.md"
+
+        {
+          echo 'report<<GHADELIM_RP'
+          cat "$RUNNER_TEMP/finops-report.md"
+          echo 'GHADELIM_RP'
+        } >> "$GITHUB_OUTPUT"
+
+    # ── 4. Post / update PR comment ─────────────────────────────────────
+    - name: Post PR comment
+      if: >-
+        github.event_name == 'pull_request'
+        && steps.collect.outputs.has_changes == 'true'
+        && inputs.post-pr-comment == 'true'
+      uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7
+      env:
+        REPORT: ${{ steps.report.outputs.report }}
+      with:
+        github-token: ${{ inputs.github-token }}
+        script: |
+          const body = process.env.REPORT;
+          if (!body) {
+            core.warning('No report content to post.');
+            return;
+          }
+
+          const marker = '<!-- devops-copilot-security -->';
+          const commentBody = `${marker}\n${body}`;
+
+          const { data: comments } = await github.rest.issues.listComments({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+          });
+
+          const existing = comments.find(c => c.body && c.body.includes(marker));
+
+          if (existing) {
+            await github.rest.issues.updateComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: existing.id,
+              body: commentBody,
+            });
+            core.info(`Updated existing comment #${existing.id}`);
+          } else {
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: commentBody,
+            });
+            core.info('Created new PR comment');
+          }
