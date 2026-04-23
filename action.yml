@@ -1,5 +1,5 @@
 name: "Terraform Security Analysis"
-description: "Analyzes Terraform PR changes for security misconfigurations using GitHub Copilot. Posts a prioritized security report as a PR comment."
+description: "Analyzes Terraform PR changes for security misconfigurations using GitHub Copilot."
 
 branding:
   icon: "shield"
